@@ -2,21 +2,23 @@
 authors = ["willemml <willem@leit.so>"]
 edition = "2018"
 readme = "README.md"
-name = "ed-joy"
+name = "joystick"
 version = "0.1.0"
+resolver = "2"
 
 [dependencies]
 cortex-m = "0.6.0"
 cortex-m-rt = "0.6.10"
 cortex-m-semihosting = "0.3.3"
 panic-halt = "0.2.0"
-stm32f3xx-hal = { version = "0.7.0", features = ["ld", "rt", "stm32f303xc"] }
+stm32f3xx-hal = { version = "0.7.0", features = ["ld", "rt", "stm32f303xc", "stm32-usbd"] }
 usb-device = "0.2.8"
-usbd-hid = "0.5.0"
+usbd-hid = { path = "../usbd-hid" }
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 
 # this lets you use `cargo fix`!
 [[bin]]
-name = "ed-joy"
+name = "joystick"
 test = false
 bench = false
 

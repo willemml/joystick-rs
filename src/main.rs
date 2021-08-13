@@ -7,105 +7,94 @@ extern crate stm32f3xx_hal as hal;
 extern crate usb_device;
 extern crate usbd_hid;
 
-use hal::pac::{interrupt, CorePeripherals, Peripherals};
+use hal::hal::digital::v2::OutputPin;
+use hal::pac::Peripherals;
 use hal::prelude::*;
+use hal::time::rate::Megahertz;
 
-use usb_device::bus::UsbBus;
-use usb_device::bus::UsbBusAllocator;
+use hal::usb::{Peripheral, UsbBus};
+
 use usb_device::prelude::*;
 
 use usbd_hid::descriptor::generator_prelude::*;
 use usbd_hid::descriptor::MouseReport;
 use usbd_hid::hid_class::HIDClass;
 
-use cortex_m::asm::delay as cycle_delay;
-use cortex_m::interrupt::free as disable_interrupts;
-use cortex_m::peripheral::NVIC;
+use cortex_m::asm::delay;
 
 use cortex_m_rt::entry;
 
 #[entry]
 fn main() -> ! {
-    let mut peripherals = Peripherals::take().unwrap();
-    let mut core = CorePeripherals::take().unwrap();
-    let mut clocks = peripherals
-        .RCC
-        .constrain()
+    let dp = Peripherals::take().unwrap();
+
+    let mut flash = dp.FLASH.constrain();
+    let mut rcc = dp.RCC.constrain();
+
+    let clocks = rcc
         .cfgr
-        .freeze(&mut peripherals.FLASH.constrain().acr);
-    let mut pins = hal::Pins::new(peripherals.PORT);
-    let mut red_led = pins.d13.into_open_drain_output(&mut pins.port);
-    red_led.set_low().unwrap();
+        .use_hse(Megahertz(8))
+        .sysclk(Megahertz(48))
+        .pclk1(Megahertz(24))
+        .pclk2(Megahertz(24))
+        .freeze(&mut flash.acr);
 
-    let bus_allocator = unsafe {
-        USB_ALLOCATOR = Some(hal::usb_allocator(
-            peripherals.USB,
-            &mut clocks,
-            &mut peripherals.PM,
-            pins.usb_dm,
-            pins.usb_dp,
-        ));
-        USB_ALLOCATOR.as_ref().unwrap()
+    assert!(clocks.usbclk_valid());
+
+    // Configure the on-board LED (LD10, south red)
+    let mut gpioe = dp.GPIOE.split(&mut rcc.ahb);
+    let mut led = gpioe
+        .pe13
+        .into_push_pull_output(&mut gpioe.moder, &mut gpioe.otyper);
+    led.set_low().ok(); // Turn off
+
+    let mut gpioa = dp.GPIOA.split(&mut rcc.ahb);
+
+    // F3 Discovery board has a pull-up resistor on the D+ line.
+    // Pull the D+ pin down to send a RESET condition to the USB bus.
+    // This forced reset is needed only for development, without it host
+    // will not reset your device when you upload new firmware.
+    let mut usb_dp = gpioa
+        .pa12
+        .into_push_pull_output(&mut gpioa.moder, &mut gpioa.otyper);
+    usb_dp.set_low().ok();
+    delay(clocks.sysclk().0 / 100);
+
+    let usb_dm =
+        gpioa
+            .pa11
+            .into_af14_push_pull(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrh);
+    let usb_dp = usb_dp.into_af14_push_pull(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrh);
+
+    let usb = Peripheral {
+        usb: dp.USB,
+        pin_dm: usb_dm,
+        pin_dp: usb_dp,
     };
-
-    unsafe {
-        USB_HID = Some(HIDClass::new(&bus_allocator, MouseReport::desc(), 60));
-        USB_BUS = Some(
-            UsbDeviceBuilder::new(&bus_allocator, UsbVidPid(0x16c0, 0x27dd))
-                .manufacturer("Fake company")
-                .product("Twitchy Mousey")
-                .serial_number("TEST")
-                .device_class(0xEF) // misc
-                .build(),
-        );
-    }
-
-    unsafe {
-        core.NVIC.set_priority(interrupt::USB, 1);
-        NVIC::unmask(interrupt::USB);
-    }
+    let usb_bus = UsbBus::new(usb);
+    let mut usb_hid = HIDClass::new(&usb_bus, MouseReport::desc(), 60);
+    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
+        .manufacturer("Fake company")
+        .product("Twitchy Mousey")
+        .serial_number("TWTC")
+        .device_class(0xEF)
+        .build();
 
     loop {
-        cycle_delay(25 * 1024 * 1024);
-        push_mouse_movement(MouseReport {
-            x: 0,
-            y: 4,
-            buttons: 0,
-            wheel: 0,
-        })
-        .ok()
-        .unwrap_or(0);
-        cycle_delay(25 * 1024 * 1024);
-        push_mouse_movement(MouseReport {
-            x: 0,
-            y: -4,
-            buttons: 0,
-            wheel: 0,
-        })
-        .ok()
-        .unwrap_or(0);
+        if !usb_dev.poll(&mut [&mut usb_hid]) {
+            led.set_high().ok();
+            continue;
+        }
+
+        usb_hid
+            .push_input(&MouseReport {
+                x: 0,
+                y: 4,
+                buttons: 0,
+                wheel: 0,
+            })
+            .ok();
+
+        led.set_low().ok();
     }
-}
-
-fn push_mouse_movement(report: MouseReport) -> Result<usize, usb_device::UsbError> {
-    disable_interrupts(|_| unsafe { USB_HID.as_mut().map(|hid| hid.push_input(&report)) }).unwrap()
-}
-
-static mut USB_ALLOCATOR: Option<UsbBusAllocator<UsbBus>> = None;
-static mut USB_BUS: Option<UsbDevice<UsbBus>> = None;
-static mut USB_HID: Option<HIDClass<UsbBus>> = None;
-
-fn poll_usb() {
-    unsafe {
-        USB_BUS.as_mut().map(|usb_dev| {
-            USB_HID.as_mut().map(|hid| {
-                usb_dev.poll(&mut [hid]);
-            });
-        });
-    };
-}
-
-#[interrupt]
-fn USB() {
-    poll_usb();
 }
